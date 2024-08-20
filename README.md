@@ -1,4 +1,4 @@
-# Protein-Abundance-Prediction
+# Protein Abundance Prediction
 
 This is a random forest machine learning model that can be used to predict protein abundance. There are 6 required pieces of information: 1. mRNA sequences (.fa.gz format), 2. 3' and 5' UTR regions (.bed file), 3. RNA abundance (.csv file), 4. Translation information (.csv file), 5. Protein abundance (.csv file), and 6. File matching cell line to its experimental alias (.csv file).
 
