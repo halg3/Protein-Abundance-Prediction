@@ -29,8 +29,6 @@ Upload all the data using file path name. There are 6 bits of information that I
 
 NOTES:
 
--   The .rda files that you upload must be named accordingly for the smooth naming of variables: 1. RNA abundance -\> rna_cl_train, 2. Translation information -\> ribo_cl_train, and 3. Protein abundance -\> prot_train.
-
 -   The rna_abundance, translation_information, and protein_abundance must be ordered so that the genes make up the row names and the cell lines/experimental alias compose the column names.
 
 -   The file matching cell lines to its experimental alias must have columns that are named experimental_alias and cell_line with identifying information.
