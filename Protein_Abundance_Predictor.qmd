@@ -1,0 +1,415 @@
+---
+title: "Protein Abundance Predictor"
+format: html
+editor: visual
+---
+
+# Protein Abundance Predictor
+
+This code will take mRNA sequences, RNA abundance, translation information, and protein abundance to train a machine learning model on predicting protein abundance. Training vs. testing samples are created using cross validation. Random forest method is used to train my model. This code is also prepared to handle data from multiple different cell lines. Random forests will be generated for each individual cell line.
+
+In order for this code to work, EVERY GENE between RNA abundance, translation information, and protein abundance MUST be shared. Whole genome FASTA files can be used for mRNA sequences. Similarly, whole genome information can be uploaded for 5' and 3' UTR regions.
+
+## Load Libraries and Data
+
+Load all necessary packages. Note that after running this block, you may have to submit 'a' within the console to complete the installation/loading of different libraries.
+
+```{r}
+library(BiocManager)
+BiocManager::install("rtracklayer")
+BiocManager::install("Biostrings")
+library(rtracklayer)
+library(Biostrings)
+library(ggplot2)
+library(caret)
+library(randomForest)
+```
+
+Upload all the data using file path name. There are 6 bits of information that I am going to need here: 1. mRNA Sequences (.fa.gz file), 2. 3' and 5' UTR regions (.bed file), 3. RNA abundance (.csv file), 4. Translation information (.csv file), 5. Protein abundance (.csv file), and 6. File matching cell line to its experimental alias (.csv file).
+
+NOTES:
+
+-   The .rda files that you upload must be named accordingly for the smooth naming of variables: 1. RNA abundance -\> rna_cl_train, 2. Translation information -\> ribo_cl_train, and 3. Protein abundance -\> prot_train.
+
+-   The rna_abundance, translation_information, and protein_abundance must be ordered so that the genes make up the row names and the cell lines/experimental alias compose the column names.
+
+-   The file matching cell lines to its experimental alias must have columns that are named experimental_alias and cell_line with identifying information.
+
+```{r}
+# In order of 1. mRNA sequences and 2. 3' and 5' UTR regions
+mrna_sequences <- readDNAStringSet('paste/path/to/file')
+utr_information <- rtracklayer::import('paste/path/to/file')
+
+# In order of 3. RNA abundance and 4. Translation information. (Needs to be normalized)
+rna_abundance <- read.csv('paste/path/to/file')
+translation_information <- read.csv('paste/path/to/file')
+
+# 5. Protein abundance. (Already normalized)
+protein_abundance <- read.csv('paste/path/to/file')
+
+# 6. Cell line identity match
+cell_lines = read.csv('paste/path/to/file')
+
+# Returns an output that will serve as a reminder as to which blocks have been run
+cat("Done")
+```
+
+## Load Functions
+
+This block contains custom functions that I wrote for future use
+
+```{r}
+# This function makes sure that all rna_abundance, translation_information, and protein_abudance are in the same order. This function will reorder ds2 to match the order of ds1. BY DEFAULT, I will structure the rest of my code to match the order of rna_abundance.
+order_data = function(ds1, ds2){
+ order1 = row.names(ds1)
+ order2 = row.names(ds2)
+ if(!identical(order1, order2)){
+   order_indices = match(order1, order2)
+   ds2 = ds2[order_indices, , drop = FALSE]
+   if(any(is.na(order_indices))){
+     return("Error: Please ensure that all genes are shared between both datasets.")
+     }
+   }
+ return(ds2)
+}
+
+# This function checks if filtered_orf table has any proteins with more than one coding sequence. If so, only the largest coding sequence is retained.
+rid_repeats = function(filtered_orf_table){
+  gene_counts <- table(filtered_orf_table$SeqNames)
+  duplicated_genes <- names(gene_counts[gene_counts > 1])
+  
+  for(gene in duplicated_genes){
+    duplicated_table = filtered_orf_table[filtered_orf_table$SeqNames == gene,]
+    max_cds_length = max(duplicated_table$Ranges.width)
+    
+    remove_indices = which((filtered_orf_table$SeqNames == gene) & (filtered_orf_table$Ranges.width != max_cds_length))
+    remove_indices = sort(remove_indices, decreasing = TRUE)
+    
+    for(index in remove_indices){
+      filtered_orf_table <- filtered_orf_table[-index, ]
+    }
+  }
+  return(filtered_orf_table)
+}
+
+# This function splits CDS into codons.
+create_codons = function(cds){
+  codon_vector = c()
+  
+  while(nchar(cds) > 0){
+    codon_vector = c(codon_vector, as.character(substr(cds, 1, 3)))
+    cds = substr(cds, 4, nchar(cds))
+  }
+  return(codon_vector)
+}
+
+# This function isolates 5' UTR sequence. If a gene does not have annotated information on 5' UTR, it is given a default sequence of "NNN"
+snatch_utr5_seqs = function(filtered_utr5_table){
+  utr5_sequences = list()
+  for(i in seq_along(mrna_sequences)){
+    if(filtered_utr5_table$Ranges.width[i] == 0){
+      utr5_sequences[[row.names(filtered_utr5_table[i,])]] <- "NNN"
+    } else {
+        start = filtered_utr5_table$Ranges.start[i]
+        end = filtered_utr5_table$Ranges.end[i]
+        utr5_sequences[[row.names(filtered_utr5_table[i,])]] <- substr(mrna_sequences[i], start, end)
+    }
+  }
+  return(utr5_sequences)
+}
+
+# This function calculated local alignment scores of each gene to the 2 different ideal Kozak sequences. The max of both scores is kept and stored in a data frame.
+kozak_alignment = function(genes, utr5_sequences){
+  kozak_sequence1 = DNAString("GCCACCATGG")
+  kozak_sequence2 = DNAString("GCCGCCATGG")
+  alignment_scores = c()
+  
+  for(gene in seq_along(utr5_sequences)){
+    utr = DNAString(as.character(utr5_sequences[[gene]]))
+    
+    prelim_alignments = c()
+    
+    prelim_alignments = c(prelim_alignments, score(pairwiseAlignment(utr, kozak_sequence1, type = "local")))
+    prelim_alignments = c(prelim_alignments, score(pairwiseAlignment(utr, kozak_sequence2, type = "local")))
+    
+    alignment_scores = c(alignment_scores, max(prelim_alignments))
+  }
+  
+  alignment_scores = data.frame(alignment_scores)
+  row.names(alignment_scores) <- genes
+  
+  return(alignment_scores)
+}
+
+# This function calculates GC content
+find_gc_content = function(genes, utr5_sequences){
+  gc_content = c()
+  for(gene in seq_along(utr5_sequences)){
+    utr = DNAString(utr5_sequences[[gene]])
+    
+    gc = letterFrequency(utr, letters = c("G", "C"))
+    gc_proportion = sum(gc) / nchar(utr)
+    gc_content = c(gc_content, gc_proportion)
+  }
+  gc_content_df = data.frame(gc_content)
+  row.names(gc_content_df) <- genes
+  
+  return(gc_content_df)
+}
+
+# This function normalizes the codons.
+normalize_codons = function(codon_list){
+  codon_vector = unlist(codon_list)
+  
+  codon_count = table(factor(codon_vector, levels = all_codons))
+  normalized_counts = codon_count / sum(codon_count)
+  
+  return(normalized_counts)
+}
+
+# This function normalizes numerical data (rna_abundance and translation_information).
+normalize_numeric = function(numeric_data){
+  normalized_data = numeric_data
+  
+  for(gene in 1:nrow(numeric_data)){
+    normalized_data[gene,] = numeric_data[gene,]*1000000 / colSums(numeric_data)
+  }
+  
+  return(normalized_data)
+}
+
+# This function will subset dataset by cell line, as identified by the cell line's experimental alias. It will return a list containing all datasets separated by cell line. Each dataset will be named by its associated cell line.
+compiled_cell_line_subset = function(cell_line_names){
+  compiled_datasets = list()
+  
+  for(cell_line in cell_line_names){
+    experimental_alias = get(cell_line)
+    
+    subset_rna_abundance = log_norm_rna[,experimental_alias, drop = FALSE]
+    colnames(subset_rna_abundance) <- paste(experimental_alias, "rna_abund", sep = "_")
+    subset_translation_info = log_norm_trans[,experimental_alias, drop = FALSE]
+    colnames(subset_translation_info) <- paste(experimental_alias, "trans_info", sep = "_")
+    subset_protein_abundance = protein_abundance[,cell_line, drop = FALSE]
+    colnames(subset_protein_abundance) <- "prot_abundance"
+    
+    compiled_data = cbind(normalized_codon_counts, normalized_kozak_scores, all_gc_content,  subset_rna_abundance, subset_translation_info, subset_protein_abundance)
+    
+    compiled_name = paste(cell_line, "compiled", sep = "_")
+    
+    compiled_datasets[[compiled_name]] <- compiled_data
+  }
+  
+  return(compiled_datasets)
+}
+
+# This function will perform cross-validation, train the model, and return a 
+perform_cv_rf = function(data, folds = 10){
+  cross_val = trainControl(
+    method = "cv",
+    number = folds,
+    savePredictions = "final",
+    returnResamp = "all"
+  )
+  
+  model = train(prot_abundance ~ ., data = data, method = "rf", trControl = cross_val, metric = "RMSE", ntree = 100)
+  
+  train_indices = model$control$index
+  test_indices = model$control$indexOut
+  
+  return(list(model = model, training = train_indices, testing = test_indices))
+}
+
+# This function will extract training and testing indices from compiled_models produced by perform_cv_rf function to output 2 things: 1. a data frame containing predicted and actual values and 2. metrics through which we can evaluate the quality of the model's predictions (RMSE, Rsquared and MAE).
+implement_and_eval = function(compiled_models){
+  results = list()
+  all_names = names(compiled_models)
+  
+  for(cell_line in seq_along(compiled_models)){
+    aggregate_plot = data.frame(Actual = numeric(), Predicted = numeric())
+    aggregate_measure = data.frame(RMSE = numeric(), Rsquared = numeric(), MAE = numeric())
+    
+    data_name = all_names[cell_line]
+    model = compiled_models[[data_name]]$model
+    testing_indices = compiled_models[[data_name]]$testing
+    
+    for(fold in seq_along(testing_indices)){
+      predictions = predict(model, compiled_datasets[[data_name]][testing_indices[[fold]],])
+      actuals = compiled_datasets[[data_name]][testing_indices[[fold]],]$prot_abundance
+      evaluation = postResample(pred = predictions, obs = actuals)
+      
+      aggregate_plot = rbind(aggregate_plot, data.frame(Actual = actuals, Predicted = predictions))
+      
+      aggregate_measure = rbind(aggregate_measure, t(data.frame(evaluation)))
+    }
+    comb_aggregate_measure = colMeans(aggregate_measure, na.rm = TRUE)
+    
+    results[[data_name]] = list(all_predictions = aggregate_plot, mean_measurements = comb_aggregate_measure)
+  }
+  return(results)
+}
+
+# Returns an output that will serve as a reminder as to which blocks have been run
+cat("Done")
+```
+
+## Clean Data
+
+This following block filters and reorganizes all of the uploaded data for smoother normalization and analysis. The mRNA sequences will be reduced to their CDS and split into codons. The cell line names and their corresponding experimental alias will be extracted and saved.
+
+```{r}
+# Extract the gene names of interest, then use the gene names to select only mRNA sequences of interest. Due to how mrna_sequences is subsetted, the filtered mrna_sequences should already be in the same order as rna_abundance.
+genes = row.names(rna_abundance)
+mrna_sequences = mrna_sequences[genes]
+
+# Ensures that rna_abundance, translation_information, and protein_abundance are all in the same order.
+translation_information = order_data(rna_abundance, translation_information)
+protein_abundance = order_data(rna_abundance, protein_abundance)
+
+# Extract the information for the start and stop of the CDS, create a new data frame of the CDs, and filter the data frame to only keep the CDS's that are of interest.
+cds_information = utr_information[utr_information$name == "CDS",]
+orf_table = data.frame(SeqNames = seqnames(cds_information), Ranges = ranges(cds_information))
+filtered_orf_table = orf_table[orf_table$SeqNames %in% genes, ]
+# The following if statement checks to see that the number of CDS matches the number of genes of interest.If the number of CDS's outnumber the genes, that suggests that there is a gene with more than 1 CDS. The following function call will only retain the largest of the CDS's. Data is also reordered to match rna_abundance.
+if(length(genes) != nrow(filtered_orf_table)){
+  filtered_orf_table = rid_repeats(filtered_orf_table)
+}
+row.names(filtered_orf_table) <- filtered_orf_table$SeqNames
+filtered_orf_table$SeqNames = NULL
+filtered_orf_table = order_data(rna_abundance, filtered_orf_table)
+
+# Slim mRNA sequences to their CDS, then split the CDS codons.
+coding_sequences = lapply(seq_along(mrna_sequences), function(i){
+  start = filtered_orf_table$Ranges.start[i]
+  end = filtered_orf_table$Ranges.end[i]
+  substr(mrna_sequences[i], start, end)
+})
+# Warning: the following line can take a while to run. My computer takes about a minute to complete.
+codons = lapply(coding_sequences, create_codons)
+codon_table = data.frame(I(codons))
+row.names(codon_table) = genes
+
+# Extract cell line names and their corresponding experimental aliases.
+cell_line_names = unique(cell_lines$cell_line)
+
+for(line in cell_line_names){
+  cell_line_subset = cell_lines[cell_lines$cell_line == line, "experiment_alias"]
+  assign(line, cell_line_subset, envir = .GlobalEnv)
+}
+
+# Declutter environment
+rm(orf_table, cds_information, coding_sequences, codons, filtered_orf_table, cell_line_subset, cell_lines, line)
+
+# Returns an output that will serve as a reminder as to which blocks have been run
+cat("Done")
+```
+
+The following block works on the bulk of data cleaning and preparation for the 5' UTRs.
+
+```{r}
+# Extract the information for the start and stop of the 5' UTR
+utr5_information = utr_information[utr_information$name == "UTR5",]
+utr5_table = data.frame(SeqNames = seqnames(utr5_information), Ranges = ranges(utr5_information))
+
+filtered_utr5_table = utr5_table[utr5_table$SeqNames %in% genes,]
+# Some genes are missing 5' UTR information. The following lines identify those genes that are missing 5' UTR information and get rid of any genes that may have more than 1 5' UTR (especially if the gene has more than 1 CDS)
+missing_utr5 = setdiff(genes, filtered_utr5_table$SeqNames)
+
+if((nrow(filtered_utr5_table) + length(missing_utr5)) > length(genes)){
+  filtered_utr5_table = rid_repeats(filtered_utr5_table)
+}
+# Genes that are missing 5' UTR information will get a default range width of 0. filtered_urf5_table reordered to match rna_abundance
+missing_utr5_df = data.frame(SeqNames = missing_utr5, Ranges.start = NA, Ranges.end = NA, Ranges.width = 0)
+filtered_utr5_table = rbind(filtered_utr5_table, missing_utr5_df)
+row.names(filtered_utr5_table) <- filtered_utr5_table$SeqNames
+filtered_utr5_table$SeqNames <- NULL
+filtered_utr5_table = order_data(rna_abundance, filtered_utr5_table)
+# Isolate 5' UTR sequences. If a gene does not have annotated 5' UTR information, it gets a default sequence of 'NNN'
+utr5_sequences = snatch_utr5_seqs(filtered_utr5_table)
+
+# Warning: this function takes a bit to run. My computer takes about 12 minutes to complete.
+kozak_scores <- kozak_alignment(genes, utr5_sequences)
+
+# Calculate GC abundance in the 5' UTR
+all_gc_content <- find_gc_content(genes, utr5_sequences)
+
+# Returns an output that will serve as a reminder as to which blocks have been run
+cat("Done")
+```
+
+## Normalize Data, Separate Data by Cell Line, Compile Data Sets by Cell Line
+
+This following block will normalize codon_table, rna_abundance, and translation_information. This block will also produce a list of data sets, separated by cell line, that compiles normalized codon counts, normalized RNA abundance, normalized translation information, and protein information.
+
+```{r}
+all_codons <- c("AAA", "AAC", "AAG", "AAT", "ACA", "ACC", "ACG", "ACT", "AGA", "AGC", "AGG", "AGT", "ATA", "ATC", "ATG", "ATT", "CAA", "CAC", "CAG", "CAT", "CCA", "CCC", "CCG", "CCT", "CGA", "CGC", "CGG", "CGT", "CTA", "CTC", "CTG", "CTT", "GAA", "GAC", "GAG", "GAT", "GCA", "GCC", "GCG", "GCT", "GGA", "GGC", "GGG", "GGT", "GTA", "GTC", "GTG", "GTT", "TAA", "TAC", "TAG", "TAT", "TCA", "TCC", "TCG", "TCT", "TGA", "TGC", "TGG", "TGT", "TTA", "TTC", "TTG", "TTT")
+
+# Normalize codon_table by the relative frequency
+normalized_codon_counts = data.frame(t(apply(codon_table, 1, normalize_codons)))
+
+# Normalize kozak_scores by normalization
+normalized_kozak_scores = scale(kozak_scores)
+
+# Normalize rna_abundance and translation_information using counts per million. These 2 lines are going to take a little bit to run. My computer takes about 1 minute 10 seconds for each.
+normalized_rna_abundance = normalize_numeric(rna_abundance)
+normalized_translation_information = normalize_numeric(translation_information)
+
+#Because both normalized_rna_abundance and normalized_translation_information exhibit a skew in the data, a log transformation is performed. 1 will be added to each value as to avoid any log(0).
+log_norm_rna = log1p(normalized_rna_abundance)
+log_norm_trans = log1p(normalized_translation_information)
+
+# Subset each normalized data set by cell line. All data from one cell line will be compiled into one data frame. The function used to perform this task can be found in the 'Load Function' portion of the document.
+compiled_datasets = compiled_cell_line_subset(cell_line_names)
+
+# Declutter environment
+rm(codon_table, rna_abundance, translation_information)
+
+# Returns an output that will serve as a reminder as to which blocks have been run
+cat("Done")
+```
+
+## Cross-Validation and Random Forest Model Generation for Each Cell Line
+
+The following block applies I function that I wrote that uses cross validation and a random forest model. The returned value should be a list of lists, with each larger list corresponding to a cell line. The sub-lists include the following information: model, training indices, testing indices. Default number of folds (cross-validation): 10. Default number of trees (random forest): 100.
+
+```{r}
+# Warning: The following function can take a while to run. My computer takes around 2 hours to complete. This is a result of the random forest model taking a bit to generate for each cell line. 
+compiled_models <- lapply(compiled_datasets, perform_cv_rf)
+```
+
+## Implement Random Forest Models
+
+The following block will access the training and testing folds that were saved alongside the random forest models to implement my model.
+
+```{r}
+results = implement_and_eval(compiled_models)
+```
+
+## Prediction Accuracy Evaluation: Numeric
+
+The following block will generate a data frame of the resulting RMSE and MAE of each model.
+
+```{r}
+model_names = names(results)
+mean_rmse = c()
+mean_mae = c()
+mean_r = c()
+
+for(i in seq_along(results)){
+  mean_rmse = c(mean_rmse, results[[model_names[i]]]$mean_measurements[["RMSE"]])
+  mean_mae = c(mean_mae, mean(results[[model_names[i]]]$mean_measurements[["MAE"]]))
+  mean_r = c(mean_r, mean(results[[model_names[i]]]$mean_measurements[["Rsquared"]]))
+}
+
+data.frame(cell_line = model_names, RMSE = mean_rmse, MAE = mean_mae, Rsquared = mean_r)
+
+rm(mean_rmse, mean_mae)
+```
+
+## Prediction Accuracy Evaluation: Visualization
+
+```{r}
+for(i in seq_along(results)){
+  model_spotlight = model_names[i]
+  plot(results[[model_spotlight]]$all_predictions, main = model_spotlight)
+}
+```
